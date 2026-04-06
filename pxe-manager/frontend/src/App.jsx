@@ -595,6 +595,68 @@ input[type=number]::-webkit-inner-spin-button{opacity:.35}
 .status-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}
 .stat-card{background:var(--bg3);border:1px solid var(--bd1);border-radius:var(--r-md);padding:16px;transition:all .2s;cursor:default}
 .stat-card:hover{border-color:var(--bd3);transform:translateY(-1px)}
+
+/* ══════════════════════════════════════════════
+   SERVER INVENTORY
+══════════════════════════════════════════════ */
+.inv-table{width:100%;border-collapse:collapse;font-size:12px}
+.inv-table th{
+  font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--t3);
+  padding:10px 12px;border-bottom:1px solid var(--bd2);
+  text-align:left;background:var(--bg3);white-space:nowrap;
+}
+.inv-table td{
+  padding:10px 12px;border-bottom:1px solid var(--bd1);
+  color:var(--t1);vertical-align:middle;
+}
+.inv-table tr:last-child td{border-bottom:none}
+.inv-table tr:hover td{background:rgba(77,139,245,.03)}
+.badge-applied{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:10px;
+  padding:2px 8px;border-radius:10px;
+  background:var(--green-dim);color:var(--green);border:1px solid rgba(13,206,138,.25)}
+.badge-pending{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:10px;
+  padding:2px 8px;border-radius:10px;
+  background:var(--yellow-dim);color:var(--yellow);border:1px solid rgba(240,160,32,.25)}
+
+/* Modal overlay */
+.modal-overlay{
+  position:fixed;inset:0;z-index:100;
+  background:rgba(5,7,15,.75);backdrop-filter:blur(4px);
+  display:flex;align-items:center;justify-content:center;padding:24px;
+}
+.modal{
+  background:var(--bg2);border:1px solid var(--bd2);border-radius:var(--r-xl);
+  width:100%;max-width:680px;max-height:90vh;overflow-y:auto;
+  box-shadow:0 24px 80px rgba(0,0,0,.6);
+}
+.modal-hd{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:18px 24px;border-bottom:1px solid var(--bd1);
+  font-family:var(--mono);font-size:12px;font-weight:600;
+  color:var(--t1);letter-spacing:.06em;text-transform:uppercase;
+  position:sticky;top:0;background:var(--bg2);z-index:1;
+}
+.modal-body{padding:24px}
+.modal-close{
+  background:none;border:none;cursor:pointer;color:var(--t3);
+  font-size:18px;line-height:1;padding:4px;border-radius:4px;
+  transition:color .15s,background .15s;
+}
+.modal-close:hover{color:var(--t1);background:var(--bg4)}
+
+.nic-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.nic-item{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:10px 14px;border-radius:var(--r);
+  background:var(--bg3);border:1px solid var(--bd1);
+  cursor:pointer;transition:all .15s;
+}
+.nic-item:hover{border-color:var(--blue);background:var(--blue-dim)}
+.nic-item-info{display:flex;flex-direction:column;gap:2px}
+.nic-item-id{font-family:var(--mono);font-size:11px;color:var(--t2);font-weight:600}
+.nic-item-desc{font-size:11px;color:var(--t3)}
+.nic-item-mac{font-family:var(--mono);font-size:12px;color:var(--blue);font-weight:600}
 `;
 
 
@@ -3165,6 +3227,488 @@ function IsoTab() {
   );
 }
 
+// ── Tab: 서버 인벤토리 ────────────────────────────────────────────────────────
+
+const EMPTY_SERVER = {
+  hostname: "", mac: "", ip: "", gateway: "", netmask: "255.255.255.0",
+  dns: "", nic: "", idracIp: "", idracUser: "root",
+  osType: "rhel", osName: "rocky", osVer: "9.6",
+  disk: "", diskMode: "auto", partScheme: "auto", autoPartType: "lvm",
+  customParts: [], rootPassword: "changeme",
+  extraUser: "", extraUserPassword: "", extraUserSudo: true,
+  packageGroups: ["@^minimal-environment"], extraPackages: [], postScript: "",
+};
+
+function RacadmModal({ onClose, onSelect }) {
+  const [form, setForm] = useState({ idracIp: "", idracUser: "root", idracPass: "" });
+  const [loading, setLoading] = useState(false);
+  const [nics, setNics]       = useState(null);
+  const [err, setErr]         = useState("");
+
+  const discover = async () => {
+    if (!form.idracIp) { setErr("iDRAC IP를 입력하세요"); return; }
+    setLoading(true); setErr(""); setNics(null);
+    try {
+      const r = await fetch(`${API}/api/racadm/mac`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ idracIp: form.idracIp, idracUser: form.idracUser, idracPass: form.idracPass }),
+      });
+      const d = await r.json();
+      if (d.error) { setErr(d.error); }
+      else         { setNics(d.nics || []); }
+    } catch (e) { setErr(String(e)); }
+    finally { setLoading(false); }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="modal-hd">
+          racadm MAC 조회
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <div className="grid grid-3" style={{ marginBottom: 16 }}>
+            <Field label="iDRAC IP">
+              <input value={form.idracIp} onChange={e => setForm(f => ({ ...f, idracIp: e.target.value }))}
+                placeholder="192.168.0.95" />
+            </Field>
+            <Field label="사용자">
+              <input value={form.idracUser} onChange={e => setForm(f => ({ ...f, idracUser: e.target.value }))} />
+            </Field>
+            <Field label="비밀번호">
+              <input type="password" value={form.idracPass}
+                onChange={e => setForm(f => ({ ...f, idracPass: e.target.value }))}
+                placeholder="calvin" />
+            </Field>
+          </div>
+          <button className="btn btn-primary" onClick={discover} disabled={loading}>
+            {loading ? "조회 중…" : "▶ NIC 조회"}
+          </button>
+          {err && (
+            <div style={{ marginTop: 12, padding: "10px 14px", borderRadius: "var(--r)",
+              background: "var(--red-dim)", border: "1px solid rgba(240,78,78,.3)",
+              fontFamily: "var(--mono)", fontSize: 11, color: "var(--red)" }}>
+              {err}
+            </div>
+          )}
+          {nics !== null && (
+            <div style={{ marginTop: 16 }}>
+              <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--t3)",
+                letterSpacing: ".08em", textTransform: "uppercase", marginBottom: 8 }}>
+                NIC 목록 — 클릭하여 선택
+              </div>
+              {nics.length === 0 ? (
+                <div style={{ color: "var(--t3)", fontSize: 12 }}>NIC를 찾을 수 없습니다</div>
+              ) : (
+                <div className="nic-list">
+                  {nics.map(n => (
+                    <div key={n.nicId} className="nic-item" onClick={() => { onSelect(n); onClose(); }}>
+                      <div className="nic-item-info">
+                        <span className="nic-item-id">{n.nicId}</span>
+                        <span className="nic-item-desc">{n.description}</span>
+                      </div>
+                      <span className="nic-item-mac">{n.mac}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ServerFormModal({ server, onClose, onSave }) {
+  const [form, setForm] = useState(server ? { ...server } : { ...EMPTY_SERVER });
+  const [showRacadm, setShowRacadm] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const save = async () => {
+    if (!form.hostname) { setErr("hostname 필수"); return; }
+    if (!form.mac)      { setErr("MAC 주소 필수"); return; }
+    setSaving(true); setErr("");
+    try {
+      const url    = server ? `${API}/api/servers/${server.id}` : `${API}/api/servers`;
+      const method = server ? "PUT" : "POST";
+      const r = await fetch(url, {
+        method, headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(form),
+      });
+      const d = await r.json();
+      if (d.error) { setErr(d.error); }
+      else         { onSave(d.server); onClose(); }
+    } catch (e) { setErr(String(e)); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <>
+      {showRacadm && (
+        <RacadmModal
+          onClose={() => setShowRacadm(false)}
+          onSelect={nic => set("mac", nic.mac)}
+        />
+      )}
+      <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+        <div className="modal">
+          <div className="modal-hd">
+            {server ? `서버 편집 — ${server.hostname}` : "새 서버 등록"}
+            <button className="modal-close" onClick={onClose}>✕</button>
+          </div>
+          <div className="modal-body">
+            {err && (
+              <div style={{ marginBottom: 16, padding: "10px 14px", borderRadius: "var(--r)",
+                background: "var(--red-dim)", border: "1px solid rgba(240,78,78,.3)",
+                fontFamily: "var(--mono)", fontSize: 11, color: "var(--red)" }}>
+                {err}
+              </div>
+            )}
+
+            {/* 기본 정보 */}
+            <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--t3)",
+              letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 10 }}>
+              기본 정보
+            </div>
+            <div className="grid grid-2" style={{ marginBottom: 16 }}>
+              <Field label="호스트명 *">
+                <input value={form.hostname} onChange={e => set("hostname", e.target.value)} placeholder="server01" />
+              </Field>
+              <Field label="MAC 주소 *">
+                <div style={{ display: "flex", gap: 6 }}>
+                  <input value={form.mac} onChange={e => set("mac", e.target.value)}
+                    placeholder="6c:2b:59:91:82:29" style={{ flex: 1 }} />
+                  <button className="btn btn-ghost btn-sm" onClick={() => setShowRacadm(true)}
+                    title="racadm으로 MAC 조회">iDRAC</button>
+                </div>
+              </Field>
+            </div>
+
+            {/* 네트워크 */}
+            <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--t3)",
+              letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 10 }}>
+              네트워크 (정적 IP)
+            </div>
+            <div className="grid grid-2" style={{ marginBottom: 16 }}>
+              <Field label="IP 주소">
+                <input value={form.ip} onChange={e => set("ip", e.target.value)} placeholder="10.0.0.11" />
+              </Field>
+              <Field label="게이트웨이">
+                <input value={form.gateway} onChange={e => set("gateway", e.target.value)} placeholder="10.0.0.1" />
+              </Field>
+              <Field label="서브넷 마스크">
+                <input value={form.netmask} onChange={e => set("netmask", e.target.value)} placeholder="255.255.255.0" />
+              </Field>
+              <Field label="DNS">
+                <input value={form.dns} onChange={e => set("dns", e.target.value)} placeholder="8.8.8.8" />
+              </Field>
+              <Field label="NIC 장치명">
+                <input value={form.nic} onChange={e => set("nic", e.target.value)} placeholder="eth0 또는 em1" />
+              </Field>
+              <Field label="iDRAC IP">
+                <input value={form.idracIp} onChange={e => set("idracIp", e.target.value)} placeholder="192.168.0.95" />
+              </Field>
+            </div>
+
+            {/* OS */}
+            <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--t3)",
+              letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 10 }}>
+              OS
+            </div>
+            <div className="grid grid-3" style={{ marginBottom: 16 }}>
+              <Field label="OS 종류">
+                <select value={form.osType} onChange={e => set("osType", e.target.value)}>
+                  <option value="rhel">RHEL 계열</option>
+                  <option value="ubuntu">Ubuntu</option>
+                </select>
+              </Field>
+              <Field label="OS 이름">
+                <select value={form.osName} onChange={e => set("osName", e.target.value)}>
+                  <option value="rocky">Rocky Linux</option>
+                  <option value="rhel">RHEL</option>
+                  <option value="centos">CentOS Stream</option>
+                  <option value="almalinux">AlmaLinux</option>
+                  <option value="ubuntu">Ubuntu</option>
+                </select>
+              </Field>
+              <Field label="버전">
+                <input value={form.osVer} onChange={e => set("osVer", e.target.value)} placeholder="9.6" />
+              </Field>
+            </div>
+
+            {/* 디스크 / 파티션 */}
+            <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--t3)",
+              letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 10 }}>
+              디스크 / 파티션
+            </div>
+            <div className="grid grid-3" style={{ marginBottom: 16 }}>
+              <Field label="디스크 장치">
+                <input value={form.disk} onChange={e => set("disk", e.target.value)} placeholder="sda (비워두면 자동)" />
+              </Field>
+              <Field label="디스크 모드">
+                <select value={form.diskMode} onChange={e => set("diskMode", e.target.value)}>
+                  <option value="auto">자동 선택</option>
+                  <option value="manual">지정</option>
+                </select>
+              </Field>
+              <Field label="파티션 방식">
+                <select value={form.partScheme} onChange={e => set("partScheme", e.target.value)}>
+                  <option value="auto">자동 (autopart)</option>
+                  <option value="manual">수동 LVM</option>
+                </select>
+              </Field>
+            </div>
+
+            {/* 계정 */}
+            <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--t3)",
+              letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 10 }}>
+              계정
+            </div>
+            <div className="grid grid-2" style={{ marginBottom: 16 }}>
+              <Field label="root 비밀번호">
+                <input type="password" value={form.rootPassword} onChange={e => set("rootPassword", e.target.value)} />
+              </Field>
+              <Field label="추가 사용자">
+                <input value={form.extraUser} onChange={e => set("extraUser", e.target.value)} placeholder="(선택)" />
+              </Field>
+            </div>
+
+            <div className="btn-row">
+              <button className="btn btn-ghost" onClick={onClose}>취소</button>
+              <button className="btn btn-primary" onClick={save} disabled={saving}>
+                {saving ? "저장 중…" : server ? "저장" : "등록"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function ApplyResultModal({ results, onClose }) {
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="modal-hd">
+          적용 결과
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          {results.map((r, i) => (
+            <div key={i} style={{ marginBottom: 12 }}>
+              <div style={{ fontFamily: "var(--mono)", fontSize: 11, fontWeight: 600,
+                color: r.ok ? "var(--green)" : "var(--red)", marginBottom: 4 }}>
+                {r.ok ? "✓" : "✗"} {r.hostname}
+              </div>
+              {r.error && (
+                <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--red)",
+                  padding: "6px 10px", background: "var(--red-dim)", borderRadius: "var(--r)" }}>
+                  {r.error}
+                </div>
+              )}
+              {(r.messages || []).map((m, j) => (
+                <div key={j} style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--t3)", paddingLeft: 8 }}>
+                  {m}
+                </div>
+              ))}
+            </div>
+          ))}
+          <div className="btn-row">
+            <button className="btn btn-primary" onClick={onClose}>닫기</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ServerInventoryTab() {
+  const [servers, setServers]         = useState([]);
+  const [editServer, setEditServer]   = useState(null);   // null=closed, false=new, obj=edit
+  const [applyResults, setApplyResults] = useState(null);
+  const [applying, setApplying]       = useState({});     // { id: true }
+  const [applyingAll, setApplyingAll] = useState(false);
+
+  const load = useCallback(() => {
+    fetch(`${API}/api/servers`).then(r => r.json())
+      .then(d => setServers(d.servers || [])).catch(() => {});
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleSave = () => load();
+
+  const deleteServer = async (id, hostname) => {
+    if (!window.confirm(`"${hostname}" 서버를 삭제할까요?`)) return;
+    await fetch(`${API}/api/servers/${id}`, { method: "DELETE" });
+    load();
+  };
+
+  const applyOne = async (id) => {
+    setApplying(a => ({ ...a, [id]: true }));
+    try {
+      const r = await fetch(`${API}/api/servers/${id}/apply`, { method: "POST" });
+      const d = await r.json();
+      setApplyResults([{ hostname: servers.find(s => s.id === id)?.hostname || id, ...d }]);
+      load();
+    } catch (e) {
+      setApplyResults([{ hostname: id, error: String(e) }]);
+    } finally {
+      setApplying(a => ({ ...a, [id]: false }));
+    }
+  };
+
+  const applyAll = async () => {
+    setApplyingAll(true);
+    try {
+      const r = await fetch(`${API}/api/servers/apply-all`, { method: "POST" });
+      const d = await r.json();
+      setApplyResults(d.results || []);
+      load();
+    } catch (e) {
+      setApplyResults([{ hostname: "전체", error: String(e) }]);
+    } finally {
+      setApplyingAll(false);
+    }
+  };
+
+  return (
+    <>
+      {editServer !== null && (
+        <ServerFormModal
+          server={editServer || null}
+          onClose={() => setEditServer(null)}
+          onSave={handleSave}
+        />
+      )}
+      {applyResults && (
+        <ApplyResultModal results={applyResults} onClose={() => setApplyResults(null)} />
+      )}
+
+      <div className="card">
+        <div className="card-hd">
+          <div className="card-hd-left">
+            <div className="card-icon" style={{ background: "rgba(124,95,230,.1)", color: "var(--purple)" }}>◧</div>
+            <div>
+              <div className="card-title">서버 인벤토리</div>
+              <div className="card-sub">서버별 호스트명 · IP · MAC · 파티션 관리 → 개별 KS 자동 생성</div>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn btn-ghost btn-sm" onClick={load}>↻ 새로고침</button>
+            <button className="btn btn-ghost btn-sm" onClick={applyAll}
+              disabled={applyingAll || servers.length === 0}>
+              {applyingAll ? "적용 중…" : "▶ 전체 적용"}
+            </button>
+            <button className="btn btn-primary btn-sm" onClick={() => setEditServer(false)}>
+              + 서버 등록
+            </button>
+          </div>
+        </div>
+
+        {servers.length === 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center",
+            padding: "48px 0", gap: 12 }}>
+            <div style={{ fontSize: 32, opacity: .2, fontFamily: "var(--mono)" }}>◧</div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--t3)" }}>
+              등록된 서버 없음
+            </div>
+            <button className="btn btn-primary btn-sm" onClick={() => setEditServer(false)}>
+              + 첫 서버 등록
+            </button>
+          </div>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table className="inv-table">
+              <thead>
+                <tr>
+                  <th>호스트명</th>
+                  <th>MAC</th>
+                  <th>IP</th>
+                  <th>OS</th>
+                  <th>디스크</th>
+                  <th>KS 파일</th>
+                  <th>상태</th>
+                  <th>동작</th>
+                </tr>
+              </thead>
+              <tbody>
+                {servers.map(sv => (
+                  <tr key={sv.id}>
+                    <td style={{ fontFamily: "var(--mono)", fontWeight: 600 }}>{sv.hostname}</td>
+                    <td style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--blue)" }}>{sv.mac}</td>
+                    <td style={{ fontFamily: "var(--mono)", fontSize: 11 }}>{sv.ip || <span style={{ color: "var(--t3)" }}>DHCP</span>}</td>
+                    <td style={{ fontSize: 11 }}>
+                      <span style={{ color: "var(--t2)" }}>{sv.osName}</span>
+                      <span style={{ color: "var(--t3)" }}> {sv.osVer}</span>
+                    </td>
+                    <td style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--t3)" }}>
+                      {sv.disk || <span style={{ color: "var(--t4)" }}>auto</span>}
+                    </td>
+                    <td style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--t3)",
+                      maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {sv.ksFile || "—"}
+                    </td>
+                    <td>
+                      {sv.applied
+                        ? <span className="badge-applied">✓ 적용됨</span>
+                        : <span className="badge-pending">미적용</span>}
+                    </td>
+                    <td>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button className="btn btn-ghost btn-xs" onClick={() => setEditServer(sv)}>편집</button>
+                        <button className="btn btn-primary btn-xs"
+                          onClick={() => applyOne(sv.id)} disabled={applying[sv.id]}>
+                          {applying[sv.id] ? "…" : "적용"}
+                        </button>
+                        <button className="btn btn-danger btn-xs"
+                          onClick={() => deleteServer(sv.id, sv.hostname)}>삭제</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* 안내 카드 */}
+      <div className="card" style={{ marginTop: 12 }}>
+        <div className="card-hd">
+          <div className="card-hd-left">
+            <div className="card-icon" style={{ background: "rgba(11,184,212,.1)", color: "var(--cyan)" }}>ℹ</div>
+            <div>
+              <div className="card-title">동작 방식</div>
+            </div>
+          </div>
+        </div>
+        <div className="card-body" style={{ fontSize: 12, color: "var(--t2)", lineHeight: 1.9 }}>
+          <ol style={{ paddingLeft: 20, display: "flex", flexDirection: "column", gap: 4 }}>
+            <li><b style={{ color: "var(--t1)" }}>서버 등록</b> — 호스트명, MAC, 고정 IP, OS, 파티션 설정 입력</li>
+            <li><b style={{ color: "var(--t1)" }}>iDRAC 조회</b> — MAC 입력란 옆 <code style={{ color: "var(--blue)" }}>iDRAC</code> 버튼 클릭 → racadm으로 NIC 목록 조회 후 선택</li>
+            <li><b style={{ color: "var(--t1)" }}>적용</b> — <code style={{ color: "var(--blue)" }}>적용</code> 클릭 시 자동으로 수행:
+              <ul style={{ paddingLeft: 18, marginTop: 4, display: "flex", flexDirection: "column", gap: 2 }}>
+                <li>서버 전용 KS 파일 생성 (<code style={{ color: "var(--green)" }}>/var/www/html/ks/servers/&lt;hostname&gt;.ks</code>)</li>
+                <li>dnsmasq <code style={{ color: "var(--yellow)" }}>dhcp-host</code> 갱신 → MAC에 고정 IP 할당</li>
+                <li>grub.cfg에 해당 서버 전용 메뉴 항목 추가</li>
+              </ul>
+            </li>
+            <li><b style={{ color: "var(--t1)" }}>PXE 부팅</b> — 서버 전원 시 dnsmasq가 MAC을 인식해 고정 IP 부여, KS 파일로 무인 설치 진행</li>
+          </ol>
+        </div>
+      </div>
+    </>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 const TABS = [
@@ -3173,6 +3717,7 @@ const TABS = [
   { id: "grub",      label: "grub.cfg",       icon: "◎" },
   { id: "monitor",   label: "설치 모니터링",  icon: "◉" },
   { id: "iso",       label: "ISO 목록",       icon: "◫" },
+  { id: "servers",   label: "서버 인벤토리",  icon: "◩" },
 ];
 
 export default function App() {
@@ -3230,6 +3775,7 @@ export default function App() {
             {tab === "grub"      && <GrubTab />}
             {tab === "monitor"   && <MonitorTab />}
             {tab === "iso"       && <IsoTab />}
+            {tab === "servers"   && <ServerInventoryTab />}
           </div>
         </div>
       </div>

@@ -1979,5 +1979,486 @@ def api_grub_nfs_build():
     return jsonify({"ok":True,"entry":entry,"skipped":False})
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 서버 인벤토리
+# ══════════════════════════════════════════════════════════════════════════════
+
+DATA_DIR      = PROJECT_ROOT / "data"
+SERVERS_FILE  = DATA_DIR / "servers.json"
+HOSTS_CONF    = Path("/etc/dnsmasq.d/pxe-hosts.conf")
+
+servers_lock  = threading.Lock()
+
+
+def _load_servers() -> list:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not SERVERS_FILE.exists():
+        return []
+    try:
+        return json.loads(SERVERS_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _save_servers(servers: list) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SERVERS_FILE.write_text(json.dumps(servers, indent=2, ensure_ascii=False))
+
+
+def _mac_to_filename(mac: str) -> str:
+    """6C:2B:59:91:82:29 → 6c-2b-59-91-82-29"""
+    return mac.lower().replace(":", "-")
+
+
+def _normalize_mac(mac: str) -> str:
+    """정규화: 대/소문자, 구분자 무관 → xx:xx:xx:xx:xx:xx (소문자)"""
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", mac)
+    if len(cleaned) != 12:
+        return mac.lower()
+    return ":".join(cleaned[i:i+2] for i in range(0, 12, 2)).lower()
+
+
+def _rebuild_hosts_conf(servers: list) -> None:
+    """전체 서버 목록으로 pxe-hosts.conf 재생성 후 dnsmasq reload"""
+    lines = ["# pxe-manager auto-generated — DO NOT EDIT MANUALLY\n"]
+    for s in servers:
+        mac = s.get("mac", "").strip()
+        ip  = s.get("ip", "").strip()
+        hn  = _sanitize_id(s.get("hostname", "")).strip()
+        if mac and ip and hn:
+            lines.append(f"dhcp-host={mac},{ip},{hn}\n")
+    try:
+        HOSTS_CONF.parent.mkdir(parents=True, exist_ok=True)
+        HOSTS_CONF.write_text("".join(lines))
+        subprocess.run(["systemctl", "reload-or-restart", "dnsmasq"],
+                       capture_output=True)
+    except Exception:
+        pass
+
+
+def _server_ks_path(server: dict) -> str:
+    """서버 전용 KS 상대 경로 (KS_DIR 기준)"""
+    hn = _sanitize_id(server.get("hostname", "")) or _mac_to_filename(server.get("mac", "unknown"))
+    return f"servers/{hn}.ks"
+
+
+def _build_server_ks(server: dict) -> str:
+    """서버별 Kickstart 생성 (정적 IP / hostname 포함)"""
+    cfg = dict(server)
+    cfg.setdefault("osType",   "rhel")
+    cfg.setdefault("disk",     "")
+    cfg.setdefault("diskMode", "auto")
+
+    # 네트워크 → 정적 IP 강제 주입
+    ip      = server.get("ip", "").strip()
+    gateway = server.get("gateway", "").strip()
+    netmask = server.get("netmask", "255.255.255.0").strip()
+    dns     = server.get("dns", "").strip()
+    nic     = _sanitize_id(server.get("nic", "").strip())
+    hostname= _sanitize_id(server.get("hostname", "localhost"))
+
+    if server.get("osType", "rhel") == "ubuntu":
+        cfg["networkMode"] = "static" if ip else "dhcp"
+        cfg["staticIp"]    = ip
+        cfg["gateway"]     = gateway
+        cfg["nameservers"] = [d.strip() for d in dns.split(",") if d.strip()]
+        cfg["nic"]         = nic
+        return _build_autoinstall(cfg)
+
+    # RHEL 계열 — network 지시문 직접 구성
+    lines = []
+    kbd = cfg.get("keyboard", "us")
+    lines += [
+        f"lang {cfg.get('lang', 'en_US.UTF-8')}",
+        f"keyboard --vckeymap={kbd} --xlayouts='{kbd}'",
+        f"timezone {cfg.get('timezone', 'Asia/Seoul')} --utc",
+        "text", "skipx",
+    ]
+
+    if ip and gateway and netmask:
+        net = (
+            f"network --bootproto=static"
+            f" --ip={ip} --netmask={netmask} --gateway={gateway}"
+        )
+        if dns:
+            first_dns = dns.split(",")[0].strip()
+            net += f" --nameserver={first_dns}"
+        if nic:
+            net += f" --device={nic}"
+        net += f" --hostname={hostname} --activate --noipv6"
+    else:
+        net = f"network --bootproto=dhcp --hostname={hostname} --activate --noipv6"
+    lines.append(net)
+
+    root_pw = cfg.get("rootPassword", "changeme")
+    lines.append(f"rootpw --iscrypted {_encrypt_pw(root_pw)}")
+
+    extra_user = _sanitize_id(cfg.get("extraUser", ""))
+    if extra_user:
+        upw  = _encrypt_pw(cfg.get("extraUserPassword", "changeme"))
+        grps = "--groups=wheel" if cfg.get("extraUserSudo") else ""
+        lines.append(f"user --name={extra_user} --password={upw} --iscrypted --shell=/bin/bash {grps}".strip())
+
+    disk      = _sanitize_id(cfg.get("disk", ""))
+    disk_mode = cfg.get("diskMode", "auto")
+    auto_disk = (disk_mode == "auto") or not disk
+
+    lines.append("zerombr")
+    if auto_disk:
+        lines.append("clearpart --all --initlabel")
+    else:
+        lines.append(f"clearpart --all --initlabel --drives={disk}")
+        lines.append(f"ignoredisk --only-use={disk}")
+
+    part_scheme = cfg.get("partScheme", "auto")
+    if part_scheme == "auto":
+        auto_type = cfg.get("autoPartType", "lvm")
+        enc = cfg.get("autoPartEncrypted", "no") == "yes"
+        enc_flag = f" --encrypted --passphrase={cfg.get('luksPassphrase','')}" if enc else ""
+        lines.append(f"autopart --type={auto_type}{enc_flag}")
+    else:
+        vg      = _sanitize_id(cfg.get("vgName", "vg_root"))
+        pv_grow = "--grow" if cfg.get("pvGrow", "grow") == "grow" else f"--size={cfg.get('pvSize',40960)}"
+        fsBoot  = cfg.get("fsBoot", "xfs")
+        pv_ondisk = f" --ondisk={disk}" if not auto_disk and disk else ""
+        lines += [
+            f"part /boot     --fstype={fsBoot} --size={cfg.get('partBoot',1024)}",
+            f"part /boot/efi --fstype=efi      --size={cfg.get('partEfi',512)}",
+            f"part pv.01     --fstype=lvmpv{pv_ondisk} --size=1 {pv_grow}",
+            f"volgroup {vg} pv.01",
+        ]
+        custom_parts = cfg.get("customParts", [])
+        if custom_parts:
+            for p in custom_parts:
+                mount  = re.sub(r"[^a-zA-Z0-9_./\-]", "", str(p.get("mount", ""))).strip()
+                size   = max(1, int(p.get("size", 2048)))
+                fstype = re.sub(r"[^a-zA-Z0-9]", "", str(p.get("fstype", "xfs")))
+                grow   = bool(p.get("grow", False))
+                if not mount:
+                    continue
+                grow_flag = " --grow" if grow else ""
+                if mount == "swap" or fstype == "swap":
+                    lines.append(f"logvol swap  --vgname={vg} --name=lv_swap --fstype=swap --size={size}{grow_flag}")
+                else:
+                    lv_name = "lv_" + re.sub(r"[^a-zA-Z0-9_]", "_", mount.strip("/")) or "lv_data"
+                    lines.append(f"logvol {mount}  --vgname={vg} --name={lv_name} --fstype={fstype} --size={size}{grow_flag}")
+        else:
+            lines += [
+                f"logvol /     --vgname={vg} --name=lv_root --fstype={cfg.get('fsRoot','xfs')} --size={cfg.get('partRoot',10240)}{' --grow' if cfg.get('rootGrow')=='grow' else ''}",
+                f"logvol /home --vgname={vg} --name=lv_home --fstype={cfg.get('fsHome','xfs')} --size={cfg.get('partHome',5120)}{' --grow' if cfg.get('homeGrow')=='grow' else ''}",
+            ]
+            if cfg.get("swapMode", "lv") != "none":
+                lines.append(f"logvol swap  --vgname={vg} --name=lv_swap --fstype=swap --size={cfg.get('partSwap',2048)}")
+            if cfg.get("separateTmp"):
+                lines.append(f"logvol /tmp  --vgname={vg} --name=lv_tmp  --fstype=xfs  --size={cfg.get('partTmp',2048)}")
+
+    # Bootloader
+    lines.append("bootloader --location=mbr")
+
+    # Packages
+    pkg_groups = cfg.get("packageGroups", ["@^minimal-environment"])
+    extra_pkgs = cfg.get("extraPackages", [])
+    lines.append("%packages")
+    for g in pkg_groups:
+        lines.append(g)
+    for p in extra_pkgs:
+        lines.append(p)
+    lines.append("%end")
+
+    # %post
+    post_lines = cfg.get("postScript", "")
+    if post_lines:
+        lines.append("%post")
+        lines.append(post_lines)
+        lines.append("%end")
+
+    lines.append("reboot")
+    return "\n".join(lines) + "\n"
+
+
+def _apply_server(server: dict) -> dict:
+    """KS 파일 생성 + dnsmasq + GRUB 메뉴 항목 추가. 오류 시 {"error": ...} 반환."""
+    msgs = []
+
+    # 1) KS 파일 생성
+    ks_rel  = _server_ks_path(server)
+    ks_file = (KS_DIR / ks_rel).resolve()
+    if not str(ks_file).startswith(str(KS_DIR.resolve())):
+        return {"error": "KS 경로 탈출 차단"}
+
+    ks_file.parent.mkdir(parents=True, exist_ok=True)
+    content = _build_server_ks(server)
+    ks_file.write_text(content)
+    _restorecon(ks_file)
+    msgs.append(f"[+] KS 생성: {ks_rel}")
+
+    # 2) dnsmasq dhcp-host 재생성
+    with servers_lock:
+        all_servers = _load_servers()
+    _rebuild_hosts_conf(all_servers)
+    msgs.append(f"[+] dnsmasq dhcp-host 갱신: {server.get('mac','')} → {server.get('ip','')}")
+
+    # 3) GRUB menuentry 추가
+    server_ip  = _get_nfs_server()
+    os_name    = _sanitize(server.get("osName", "rocky"), r"[^a-zA-Z0-9_\-]")
+    os_ver     = _sanitize(server.get("osVer",  "9.6"),   r"[^0-9._]")
+    hostname   = _sanitize_id(server.get("hostname", "server"))
+    ks_url     = f"http://{server_ip}/ks/{ks_rel}"
+
+    cfg_file = TFTP_ROOT / "grub.cfg"
+    if cfg_file.exists():
+        content_grub = cfg_file.read_text()
+        label = f"{hostname} [{os_name.capitalize()} {os_ver}]"
+        if ks_url not in content_grub:
+            if os_name == "ubuntu":
+                ud_dir  = ks_rel.replace(".ks", "")
+                ds_url  = f"http://{server_ip}/ks/{ud_dir}/"
+                iso_glob = list(Path(WWW_ROOT / "ubuntu" / os_ver).glob("*.iso"))
+                iso_nm   = iso_glob[0].name if iso_glob else f"ubuntu-{os_ver}-live-server-amd64.iso"
+                entry = (
+                    f"menuentry \"{label} [AUTO]\" {{\n"
+                    f"    linuxefi (http)/ubuntu/{os_ver}/casper/vmlinuz \\\n"
+                    f"        ip=dhcp url=http://{server_ip}/ubuntu/{os_ver}/{iso_nm} \\\n"
+                    f"        autoinstall ds=nocloud-net\\;s={ds_url} \\\n"
+                    f"        quiet splash ---\n"
+                    f"    initrdefi (http)/ubuntu/{os_ver}/casper/initrd\n"
+                    f"}}"
+                )
+            else:
+                entry = (
+                    f"menuentry \"{label} [KS]\" {{\n"
+                    f"    linuxefi (http)/{os_name}/{os_ver}/images/pxeboot/vmlinuz \\\n"
+                    f"        ip=dhcp \\\n"
+                    f"        inst.stage2=http://{server_ip}/{os_name}/{os_ver} \\\n"
+                    f"        inst.ks={ks_url}\n"
+                    f"    initrdefi (http)/{os_name}/{os_ver}/images/pxeboot/initrd.img\n"
+                    f"}}"
+                )
+            cfg_file.write_text(content_grub.rstrip() + f"\n\n{entry}\n")
+            _restorecon(cfg_file)
+            msgs.append(f"[+] GRUB 메뉴 항목 추가: {label}")
+        else:
+            msgs.append(f"[=] GRUB 항목 이미 존재: {ks_url}")
+    else:
+        msgs.append("[!] grub.cfg 없음 — GRUB 항목 건너뜀")
+
+    return {"ok": True, "messages": msgs, "ks_file": ks_rel}
+
+
+# ── 서버 인벤토리 CRUD ─────────────────────────────────────────────────────────
+
+@app.route("/api/servers", methods=["GET"])
+def api_servers_list():
+    with servers_lock:
+        servers = _load_servers()
+    return jsonify({"servers": servers})
+
+
+@app.route("/api/servers", methods=["POST"])
+def api_servers_create():
+    d = request.json or {}
+    mac = _normalize_mac(d.get("mac", ""))
+    if not mac:
+        return jsonify({"error": "mac 필수"}), 400
+    hostname = _sanitize_id(d.get("hostname", ""))
+    if not hostname:
+        return jsonify({"error": "hostname 필수"}), 400
+
+    server = {
+        "id":               uuid.uuid4().hex,
+        "hostname":         hostname,
+        "mac":              mac,
+        "ip":               d.get("ip", ""),
+        "gateway":          d.get("gateway", ""),
+        "netmask":          d.get("netmask", "255.255.255.0"),
+        "dns":              d.get("dns", ""),
+        "nic":              _sanitize_id(d.get("nic", "")),
+        "idracIp":          d.get("idracIp", ""),
+        "idracUser":        d.get("idracUser", "root"),
+        "osType":           d.get("osType", "rhel"),
+        "osName":           _sanitize(d.get("osName", "rocky"), r"[^a-zA-Z0-9_\-]"),
+        "osVer":            _sanitize(d.get("osVer",  "9.6"),   r"[^0-9._]"),
+        "disk":             _sanitize_id(d.get("disk", "")),
+        "diskMode":         d.get("diskMode", "auto"),
+        "partScheme":       d.get("partScheme", "auto"),
+        "autoPartType":     d.get("autoPartType", "lvm"),
+        "customParts":      d.get("customParts", []),
+        "rootPassword":     d.get("rootPassword", "changeme"),
+        "extraUser":        _sanitize_id(d.get("extraUser", "")),
+        "extraUserPassword":d.get("extraUserPassword", ""),
+        "extraUserSudo":    bool(d.get("extraUserSudo", True)),
+        "packageGroups":    d.get("packageGroups", ["@^minimal-environment"]),
+        "extraPackages":    d.get("extraPackages", []),
+        "postScript":       d.get("postScript", ""),
+        "ksFile":           "",
+        "applied":          False,
+        "createdAt":        int(time.time()),
+    }
+
+    with servers_lock:
+        servers = _load_servers()
+        # MAC 중복 체크
+        if any(s["mac"] == mac for s in servers):
+            return jsonify({"error": f"MAC 중복: {mac}"}), 409
+        servers.append(server)
+        _save_servers(servers)
+
+    return jsonify({"ok": True, "server": server}), 201
+
+
+@app.route("/api/servers/<server_id>", methods=["PUT"])
+def api_servers_update(server_id):
+    d = request.json or {}
+    with servers_lock:
+        servers = _load_servers()
+        idx = next((i for i, s in enumerate(servers) if s["id"] == server_id), None)
+        if idx is None:
+            return jsonify({"error": "Not found"}), 404
+
+        s = servers[idx]
+        for field in ["hostname", "ip", "gateway", "netmask", "dns", "nic",
+                      "idracIp", "idracUser", "osType", "osName", "osVer",
+                      "disk", "diskMode", "partScheme", "autoPartType",
+                      "customParts", "rootPassword", "extraUser",
+                      "extraUserPassword", "extraUserSudo",
+                      "packageGroups", "extraPackages", "postScript"]:
+            if field in d:
+                val = d[field]
+                if field in ("hostname", "nic", "disk", "extraUser"):
+                    val = _sanitize_id(str(val))
+                elif field in ("osName",):
+                    val = _sanitize(str(val), r"[^a-zA-Z0-9_\-]")
+                elif field in ("osVer",):
+                    val = _sanitize(str(val), r"[^0-9._]")
+                s[field] = val
+        if "mac" in d:
+            new_mac = _normalize_mac(d["mac"])
+            if new_mac != s["mac"] and any(sv["mac"] == new_mac for sv in servers):
+                return jsonify({"error": f"MAC 중복: {new_mac}"}), 409
+            s["mac"] = new_mac
+        s["applied"] = False  # 설정 변경 → 재적용 필요
+        servers[idx] = s
+        _save_servers(servers)
+    return jsonify({"ok": True, "server": s})
+
+
+@app.route("/api/servers/<server_id>", methods=["DELETE"])
+def api_servers_delete(server_id):
+    with servers_lock:
+        servers = _load_servers()
+        target = next((s for s in servers if s["id"] == server_id), None)
+        if not target:
+            return jsonify({"error": "Not found"}), 404
+        # KS 파일 삭제
+        ks_rel = target.get("ksFile", "")
+        if ks_rel:
+            ks_f = (KS_DIR / ks_rel).resolve()
+            if str(ks_f).startswith(str(KS_DIR.resolve())) and ks_f.exists():
+                ks_f.unlink()
+        servers = [s for s in servers if s["id"] != server_id]
+        _save_servers(servers)
+        _rebuild_hosts_conf(servers)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/servers/<server_id>/apply", methods=["POST"])
+def api_servers_apply(server_id):
+    with servers_lock:
+        servers = _load_servers()
+        idx = next((i for i, s in enumerate(servers) if s["id"] == server_id), None)
+        if idx is None:
+            return jsonify({"error": "Not found"}), 404
+        server = servers[idx]
+
+    result = _apply_server(server)
+    if "error" in result:
+        return jsonify(result), 500
+
+    with servers_lock:
+        servers = _load_servers()
+        idx2 = next((i for i, s in enumerate(servers) if s["id"] == server_id), None)
+        if idx2 is not None:
+            servers[idx2]["ksFile"]  = result["ks_file"]
+            servers[idx2]["applied"] = True
+            _save_servers(servers)
+
+    return jsonify(result)
+
+
+@app.route("/api/servers/apply-all", methods=["POST"])
+def api_servers_apply_all():
+    with servers_lock:
+        servers = _load_servers()
+    results = []
+    for server in servers:
+        r = _apply_server(server)
+        results.append({"id": server["id"], "hostname": server["hostname"], **r})
+    # 적용 상태 일괄 업데이트
+    with servers_lock:
+        svs = _load_servers()
+        for sv in svs:
+            r = next((x for x in results if x["id"] == sv["id"]), None)
+            if r and r.get("ok"):
+                sv["ksFile"]  = r.get("ks_file", sv.get("ksFile", ""))
+                sv["applied"] = True
+        _save_servers(svs)
+    return jsonify({"results": results})
+
+
+# ── racadm MAC 조회 ───────────────────────────────────────────────────────────
+
+@app.route("/api/racadm/mac", methods=["POST"])
+def api_racadm_mac():
+    d = request.json or {}
+    idrac_ip   = d.get("idracIp",   "").strip()
+    idrac_user = d.get("idracUser", "root").strip()
+    idrac_pass = d.get("idracPass", "").strip()
+
+    if not idrac_ip:
+        return jsonify({"error": "idracIp 필수"}), 400
+
+    # 입력값 검증 (인젝션 방지)
+    if not re.match(r"^[0-9a-zA-Z.\-]+$", idrac_ip):
+        return jsonify({"error": "idracIp 형식 오류"}), 400
+    if not re.match(r"^[a-zA-Z0-9_\-]+$", idrac_user):
+        return jsonify({"error": "idracUser 형식 오류"}), 400
+    # 패스워드: 특수문자 허용하되 셸 실행에 list 방식으로 전달 (인젝션 없음)
+
+    if not shutil.which("racadm"):
+        return jsonify({"error": "racadm 명령어를 찾을 수 없습니다. iDRAC RCSADM 패키지를 설치하세요."}), 500
+
+    try:
+        proc = subprocess.run(
+            ["racadm", "-r", idrac_ip, "-u", idrac_user, "-p", idrac_pass,
+             "hwinventory", "nic", "--nocertwarn"],
+            capture_output=True, text=True, timeout=30
+        )
+        output = proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "racadm 타임아웃 (30s)"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # 파싱: "NIC.Embedded.1-1-1:Description - AA:BB:CC:DD:EE:FF"
+    nics = []
+    current_id = current_desc = None
+    for line in output.splitlines():
+        line = line.strip()
+        m = re.match(
+            r"^(NIC\.[^\s:]+):(.+?)\s+-\s+([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\s*$",
+            line
+        )
+        if m:
+            current_id   = m.group(1)
+            current_desc = m.group(2).strip()
+            mac          = m.group(3).lower()
+            nics.append({"nicId": current_id, "description": current_desc, "mac": mac})
+
+    if not nics and proc.returncode != 0:
+        return jsonify({"error": output[:500] or "racadm 오류"}), 500
+
+    return jsonify({"nics": nics, "raw": output})
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
